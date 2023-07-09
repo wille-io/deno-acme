@@ -1,3 +1,5 @@
+[![Latest version](https://deno.land/badge/acme/version)](https://deno.land/x/acme)
+
 # deno-acme
 Get certificates for your domains and subdomains via http challenges from an acme server.
 Use the CLI as a standalone acme client, ...
@@ -23,4 +25,5 @@ const { domainCertificates } = await ACME.getCertificateForDomain("example.com",
 console.log(domainCertificates);
 ```
 
-License: MIT
+## License
+MIT
