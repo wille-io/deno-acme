@@ -1,8 +1,8 @@
 import * as jose from "https://deno.land/x/jose@v4.14.4/index.ts";
-import { serve } from "https://deno.land/std@0.173.0/http/server.ts";
+import { serve } from "https://deno.land/std@0.193.0/http/server.ts";
 import { KJUR, KEYUTIL } from "npm:jsrsasign";
-import { encode as encodeBase64Url } from "https://deno.land/std@0.192.0/encoding/base64url.ts";
-import { decode as decodeHex } from "https://deno.land/std@0.192.0/encoding/hex.ts";
+import { encode as encodeBase64Url } from "https://deno.land/std@0.193.0/encoding/base64url.ts";
+import { decode as decodeHex } from "https://deno.land/std@0.193.0/encoding/hex.ts";
 
 
 export type Domain = { domainName: string, subdomains?: string[] };
