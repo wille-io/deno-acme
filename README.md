@@ -1,6 +1,6 @@
+# deno-acme
 [![Latest version](https://deno.land/badge/acme/version)](https://deno.land/x/acme)
 
-# deno-acme
 Get certificates for your domains and subdomains via http challenges from an acme server.
 Use the CLI as a standalone acme client, ...
 or use the acme.ts library to use it in your own application.
