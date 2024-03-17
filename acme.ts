@@ -5,73 +5,110 @@ import { encode as encodeBase64Url } from "https://deno.land/std@0.193.0/encodin
 import { decode as decodeHex } from "https://deno.land/std@0.193.0/encoding/hex.ts";
 
 
-export type Domain = { domainName: string, subdomains?: string[] };
+type JoseAccountKeys = { publicKey: jose.KeyLike, privateKey: jose.KeyLike, exists: boolean };
+
+
+// exports
+
+
+export interface Domain { domainName: string, subdomains?: string[] };
 export type DomainCertificate = { domainName: string, subdomains?: string[], pemCertificate: string, pemPublicKey: string, pemPrivateKey: string };
 export type AccountKeys = { pemPublicKey: string, pemPrivateKey: string };
 
 
-export async function getCertificateForDomain(domainName: string, acmeDirectoryUrl: string, yourEmail?: string, 
-  pemAccountKeys?: AccountKeys)
+async function getAccountKeys(pemAccountKeys?: AccountKeys)
+{
+  if (pemAccountKeys)
+  {
+    return {
+      publicKey: await jose.importSPKI(pemAccountKeys.pemPublicKey, "ES256", { extractable: true }),
+      privateKey: await jose.importPKCS8(pemAccountKeys.pemPrivateKey, "ES256", { extractable: true }),
+      exists: true,
+    } satisfies JoseAccountKeys;
+  }
+
+  return { ...(await jose.generateKeyPair('ES256', { extractable: true })), exists: false } satisfies JoseAccountKeys;
+}
+
+
+export async function getCertificateWithHttp(domainName: string, acmeDirectoryUrl: string, options?: { yourEmail?: string,
+  pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo  })
     : Promise<{domainCertificate: DomainCertificate, pemAccountKeys: AccountKeys}>
 {
-  const ret = await getCertificateForDomainsWithSubdomains([{ domainName }], acmeDirectoryUrl, yourEmail, pemAccountKeys);
+  const ret = await getCertificatesWithHttp([{ domainName }], acmeDirectoryUrl, options);
   return { domainCertificate: ret.domainCertificates[0], pemAccountKeys: ret.pemAccountKeys };
 }
 
 
-export async function getCertificateForDomainsWithSubdomains(domains: Domain[], acmeDirectoryUrl: string, yourEmail?: string, 
-  pemAccountKeys?: AccountKeys)
+export async function getCertificatesWithHttp(domains: Domain[], acmeDirectoryUrl: string, options?: { yourEmail?: string,
+  pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
   : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
 {
-  let accountKeys: { publicKey: jose.KeyLike, privateKey: jose.KeyLike };
+  return new ACMEHttp(await getAccountKeys(options?.pemAccountKeys), domains, acmeDirectoryUrl, options?.yourEmail, options?.csrInfo).getCertificates();
+}
 
-  if (pemAccountKeys)
-  {
-    //console.log("pemAccountKeys", pemAccountKeys);
-    accountKeys = 
-    { 
-      publicKey: await jose.importSPKI(pemAccountKeys.pemPublicKey, "ES256", { extractable: true }), 
-      privateKey: await jose.importPKCS8(pemAccountKeys.pemPrivateKey, "ES256", { extractable: true }),
-    };
-  }
-  else
-  {
-    accountKeys = await jose.generateKeyPair('ES256', { extractable: true });
-  }
 
-  return new ACME(accountKeys, domains, acmeDirectoryUrl, yourEmail).getCertificateForDomainsWithSubdomains();
+export async function getCertificateWithCloudflare(bearer: string, domainName: string, acmeDirectoryUrl: string, options: { yourEmail?: string,
+  pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
+    : Promise<{domainCertificate: DomainCertificate, pemAccountKeys: AccountKeys}>
+{
+  const ret = await getCertificatesWithCloudflare(bearer, [{ domainName }], acmeDirectoryUrl, options);
+  return { domainCertificate: ret.domainCertificates[0], pemAccountKeys: ret.pemAccountKeys };
+}
+
+
+export async function getCertificatesWithCloudflare(bearer: string, domains: Domain[], acmeDirectoryUrl: string, options?: { yourEmail?: string,
+  pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
+  : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
+{
+  return new ACMECloudflare(bearer, await getAccountKeys(options?.pemAccountKeys), domains, acmeDirectoryUrl, options?.yourEmail, options?.csrInfo).getCertificates();
+}
+
+
+export interface CSRInfo
+{
+  countryCode: string;
+  organization: string;
 }
 
 
 // end of exports
 
 
-type Nonce = string; 
+type Nonce = string;
 type AcmeDirectoryUrls = { newAccount: string, newNonce: string, newOrder: string };
+type Auth = { challengeUrl: string, keyAuth: string, token: string, authUrl: string };
 
 
-class ACME
+function orError(message: string): never
 {
-  public constructor(accountKeys: { publicKey: jose.KeyLike, privateKey: jose.KeyLike },
-    domains: Domain[], acmeDirectoryUrl: string, email?: string)
+  throw new Error(message);
+}
+
+
+abstract class ACMEBase
+{
+  public constructor(challengeType: string, accountKeys: JoseAccountKeys,
+    domains: Domain[], acmeDirectoryUrl: string, email?: string, csrInfo?: CSRInfo)
   {
     this.nonce = null;
     this.accountKeys = accountKeys;
     this.email = email;
     this.kid = null;
     this.domains = domains;
-    this.jwk = null;
     this.acmeDirectoryUrl = acmeDirectoryUrl;
+    this.csr = csrInfo;// || { countryCode: "US", organization: "deno-acme" };
+    this.challengeType = challengeType;
   }
 
 
-  public async getCertificateForDomainsWithSubdomains()
+  public async getCertificates()
     : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
   {
-    await this.processAcmeDirectory();
+    const acmeDirectoryUrls: AcmeDirectoryUrls = await this.processAcmeDirectory();
 
-    await this.getNonce();
-    await this.createAccount();
+    await this.getNonce(acmeDirectoryUrls.newNonce);
+    const jwk = await this.createAccount(acmeDirectoryUrls.newAccount);
 
     const domainCertificates: DomainCertificate[] = [];
 
@@ -79,29 +116,25 @@ class ACME
     {
       try
       {
-        const { finalizeUrl, authUrls } = await this.newOrder(domain);
-    
-        const auths = [];
+        const { finalizeUrl, authUrls, orderUrl } = await this.newOrder(domain, acmeDirectoryUrls.newOrder);
+
+        const auths: Auth[] = [];
         for (const authUrl of authUrls)
         {
-          auths.push(await this.newAuth(authUrl));
+          auths.push(await this.newAuth(authUrl, jwk));
         }
-    
-        for (const auth of auths)
-        {
-          // TODO: use one webserver; and fire all challenges at once
-          await this.newChallenge(auth.token, auth.keyAuth, auth.challengeUrl);
-        }
-    
-        const { orderUrl, domainPublicKey, domainPrivateKey } = await this.newFinalize(domain, finalizeUrl);
+
+        await this.newChallenges(domain, auths);
+
+        const { domainPublicKey, domainPrivateKey } = await this.newFinalize(domain, finalizeUrl);
         const { certificateUrl } = await this.newReorder(orderUrl);
         const cert = await this.getCert(certificateUrl);
 
         domainCertificates.push(
-          { 
+          {
             domainName: domain.domainName,
             subdomains: domain.subdomains,
-            pemCertificate: cert, 
+            pemCertificate: cert,
             pemPublicKey: domainPublicKey,
             pemPrivateKey: domainPrivateKey,
           });
@@ -115,8 +148,8 @@ class ACME
     }
 
 
-    const pemAccountKeys: AccountKeys = 
-      { 
+    const pemAccountKeys: AccountKeys =
+      {
         pemPublicKey: await jose.exportSPKI(this.accountKeys.publicKey),
         pemPrivateKey: await jose.exportPKCS8(this.accountKeys.privateKey),
       };
@@ -127,25 +160,25 @@ class ACME
 
   // private
   private nonce: Nonce | null;
-  private accountKeys: { publicKey: jose.KeyLike, privateKey: jose.KeyLike };
+  private accountKeys: JoseAccountKeys;
   private email: string | undefined;
   private kid: string | null;
   private domains: Domain[];
-  private jwk: jose.JWK | null;
   private acmeDirectoryUrl: string;
-  private acmeDirectoryUrls: AcmeDirectoryUrls;
-  
+  private csr: CSRInfo | undefined;
+  private challengeType: string;
+
 
   private async processAcmeDirectory()
   {
     const res = await fetch(this.acmeDirectoryUrl);
     await checkResponseStatus(res, 200);
-    this.acmeDirectoryUrls = await res.json();
     //console.log("this.acmeDirectoryUrls", this.acmeDirectoryUrls);
+    return await res.json() as AcmeDirectoryUrls;
   }
 
 
-  private async post(url: string, payload: string | Record<string, unknown> = "", 
+  protected async post(url: string, payload: string | Record<string, unknown> = "",
     expectedStatus: number | number[] = 200, additionalProtectedHeaderValues?: Record<string, unknown>)
     : Promise<Response>
   {
@@ -154,16 +187,16 @@ class ACME
     const jws = await new jose.FlattenedSign(
       new TextEncoder().encode(payloadString))
         .setProtectedHeader(
-        { 
-          alg: 'ES256', 
-          b64: true, 
-          nonce: this.nonce, 
+        {
+          alg: 'ES256',
+          b64: true,
+          nonce: this.nonce,
           url: url,
           ...(this.kid ? { kid: this.kid } : {}),
           ...additionalProtectedHeaderValues,
         })
         .sign(this.accountKeys.privateKey);
-  
+
     const res = await fetch(url,
       {
         method: "POST",
@@ -173,20 +206,22 @@ class ACME
         },
         body: JSON.stringify(jws),
       });
-        
+
     await checkResponseStatus(res, ...(Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus])); //Array.isArray(expectedStatus) ? expectedStatus as number[] : [expectedStatus as number]);
 
     this.nonce = getNonceFromResponse(res);
-  
+
+    //console.log("post", url, res.headers, res.statusText);
+
     return res;
   }
 
 
-  private async getNonce()
+  private async getNonce(url: string)
   {
-    console.debug("nonce..");
-    const res = await fetch(this.acmeDirectoryUrls.newNonce, 
-    { 
+    //console.debug("> nonce");
+    const res = await fetch(url,
+    {
       method: "HEAD",
     });
 
@@ -196,90 +231,124 @@ class ACME
   }
 
 
-  private async newAuth(authUrl: string)
+  private async newAuth(authUrl: string, jwk: jose.JWK): Promise<Auth>
   {
-    console.debug("authz..");
+    //console.debug("> newAuth");
 
+    //console.log("post auth", authUrl);
     const res = await this.post(authUrl);
 
     const json = await res.json();
+    //console.log("auth json", json);
+
+    const status = getStringFromJson("status", json);
+
+    if (!["pending", "valid"].includes(status))
+    {
+      throw new Error(`order status not 'valid' or 'pending', but '${status}' - response: ${JSON.stringify(json)}`); // TODO: error message instead of full json
+    }
 
     type Challenge = { type: string, url: string, token: string };
     const challenges: Challenge[] = getValueFromJson("challenges", json) as Challenge[];
+    //console.log("challenges", challenges);
 
-    const httpChallenge = challenges.find(obj => obj.type === "http-01");
+    const challenge = challenges.find(obj => obj.type === this.challengeType);
+    //console.log("chosen challenge", challenge);
 
-    if (!httpChallenge)
-      throw new Error("newAuth: no suitable challenge (http-01) received from acme server!");
+    if (!challenge)
+    {
+      throw new Error(`newAuth: no suitable challenge (${this.challengeType}) received from acme server!`);
+    }
 
-    checkUrl(httpChallenge.url);
+    // TODO: check if challenge 'status' already 'valid' - then directly finalize
 
-    if (httpChallenge.token.length < 1)
-      throw new Error("newAuth: no suitable token in http-01 challenge received from acme server!");
+    checkUrl(challenge.url);
 
-    const keyAuth = httpChallenge.token + '.' + await jose.calculateJwkThumbprint(this.jwk);
+    if (challenge.token.length < 1)
+    {
+      throw new Error(`newAuth: no suitable token in ${this.challengeType} challenge received from acme server!`);
+    }
 
-    return { challengeUrl: httpChallenge.url, keyAuth: keyAuth, token: httpChallenge.token };
+    const keyAuth = challenge.token + '.' + await jose.calculateJwkThumbprint(jwk);
+
+    return { challengeUrl: challenge.url, keyAuth: keyAuth, token: challenge.token, authUrl };
   }
 
 
-  private async newOrder(domain: Domain)
+  private async newOrder(domain: Domain, url: string)
   {
-    console.debug("new order..");
+    //console.debug("> newOrder");
 
-    const url = this.acmeDirectoryUrls.newOrder;
     const domainName = domain.domainName;
 
-    const identifiersArray = 
+    const identifiersArray =
     [
       { "type": "dns", "value": domainName },
       ...(domain.subdomains?.map(subdomain => ({ type: "dns", value: subdomain + "." + domainName })) || []), // <= subdomains
     ];
 
-    const res = await this.post(url, 
+    //console.log("post new order", url);
+    const res = await this.post(url,
       {
-        "identifiers": //
-        identifiersArray,
+        "identifiers": identifiersArray,
       }, 201);
 
-    const json = await res.json();
+    const orderUrl = checkUrl(res.headers.get("Location") || orError("Location header missing"));
+    //console.log("orderUrl (from Location header)", orderUrl);
 
-    const finalizeUrl = getValueFromJson("finalize", json) as string;
-    checkUrl(finalizeUrl);
+    const json = await res.json();
+    //console.log("order json", json);
+
+    // TODO: check if 'status' already 'ready' - then directly finalize
+
+    const finalizeUrl = checkUrl(getStringFromJson("finalize", json) as string);
+    //console.log("finalizeUrl", finalizeUrl);
 
     const authUrls = (getValueFromJson("authorizations", json) as string[]);
     authUrls.forEach(authUrl => { checkUrl(authUrl) });
+    //console.log("authUrls", authUrls);
 
-    return { finalizeUrl: finalizeUrl, authUrls: authUrls };
+    return { finalizeUrl, authUrls, orderUrl };
   }
 
-  
-  private async createAccount()//: Promise<void>
-  {
-    console.debug("create account..");
-    this.jwk = await jose.exportJWK(this.accountKeys.publicKey);
-    
-    const url = this.acmeDirectoryUrls.newAccount;
 
-    const res = await this.post(url, 
+  private async createAccount(url: string)//: Promise<void>
+  {
+    //console.debug("create account.. exists?", this.accountKeys.exists);
+
+    const jwk = await jose.exportJWK(this.accountKeys.publicKey);
+
+    // TODO: 7.3.3. ?
+
+    const res = await this.post(url,
       {
-        "termsOfServiceAgreed": true,
-        "contact": (this.email ? [ `mailto:${this.email}`, ] : null),
-      }, 
-      [200, 201], { jwk: this.jwk });
+        ...(this.accountKeys.exists ?
+          {
+            onlyReturnExisting: true
+          }
+          :
+          {
+            termsOfServiceAgreed: true,
+            contact: (this.email ? [ `mailto:${this.email}`, ] : null),
+          }
+        )
+      },
+      (this.accountKeys.exists ? 200 : 201), { jwk });
 
     this.kid = getHeaderFromResponse(res, "location");
-    console.debug("kid", this.kid);
+    //console.debug("kid", this.kid);
+
+    return jwk;
   }
 
 
   private async newReorder(orderUrl: string)
   {
-    console.debug("reorder..");
+    //console.debug("> reorder");
 
     const res = await this.post(orderUrl);
     const json = await res.json();
-    const certificateUrl = getValueFromJson("certificate", json) as string;
+    const certificateUrl = getStringFromJson("certificate", json) as string;
 
     checkUrl(certificateUrl);
 
@@ -289,7 +358,7 @@ class ACME
 
   private async newFinalize(domain: Domain, finalizeUrl: string)
   {
-    console.debug("finalize..");
+    //console.debug("> finalize");
     const { publicKey, privateKey } = await jose.generateKeyPair('ES256', { extractable: true }); // keys for the csr and the to-be requested certificate(s)
 
     const spkiPemPubCSR = await jose.exportSPKI(publicKey);
@@ -298,33 +367,38 @@ class ACME
     const publicKeyCSR = KEYUTIL.getKey(spkiPemPubCSR);
     const privateKeyCSR = KEYUTIL.getKey(pkcs8PemPrvCSR);
 
-    const subjectAltNameArray = 
+    const subjectAltNameArray =
     [
-      { dns: domain.domainName }, 
+      { dns: domain.domainName },
       ...(domain.subdomains?.map(subdomain => ({ dns: subdomain+"."+domain.domainName }) ) || []), // <= subdomains
     ];
 
     const csr = new KJUR.asn1.csr.CertificationRequest(
     {
-      subject: { str: `/C=DE/O=wille.io/CN=${domain.domainName}` },
+      // TODO: add available csr info(s) to subject
+
+      //subject: { str: `/C=${this.csr.countryCode}/O=${this.csr.organization.replace("/","//")}/CN=${domain.domainName}` },
+      subject: { str: `/CN=${domain.domainName}` },
       sbjpubkey: publicKeyCSR,
       extreq: [{ extname: "subjectAltName", array: subjectAltNameArray }],
       sigalg: "SHA256withECDSA",
       sbjprvkey: privateKeyCSR,
     });
-    
+
     const csrDerHexString = csr.tohex();
     const csrDerHexRaw = decodeHex(new TextEncoder().encode(csrDerHexString));
     const csrDer = encodeBase64Url(csrDerHexRaw);
-    
+
 
     const res = await this.post(finalizeUrl, { csr: csrDer });
     const json = await res.json();
-    const status = getValueFromJson("status", json) as string;
+    const status = getStringFromJson("status", json) as string;
 
     if (["invalid", "pending"].includes(status))
+    {
       throw new Error(`newFinalize: acme server answered with status 'invalid' or 'pending': '${json}' - headers: '${res.headers}'`);
-    
+    }
+
     // pending means: 'The server does not believe that the client has fulfilled the requirements.' see https://datatracker.ietf.org/doc/html/rfc8555#section-7.4
     // TODO: be able to re-do challenges on pending?
 
@@ -340,7 +414,7 @@ class ACME
     {
       const retryAfter: number = (parseInt(res.headers.get("retry-after") || "10") || 10) + 2;
 
-      console.log(`waiting ${retryAfter} seconds for the acme server to process our certificate...`);
+      //console.log(`waiting ${retryAfter} seconds for the acme server to process our certificate...`);
       await waitSeconds(retryAfter);
     }
 
@@ -351,117 +425,320 @@ class ACME
 
   private async getCert(certificateUrl: string): Promise<string>
   {
-    console.debug("cert..");
+    //console.debug("> cert");
 
     const res = await this.post(certificateUrl);
     const text = await res.text();
     const certList = text.split("-----END CERTIFICATE-----").map(cert => cert + "-----END CERTIFICATE-----");
 
     if (certList.length < 1)
+    {
       throw new Error("getCert: no valid certificate received from acme server - response text was: " + text);
+    }
 
     const cert = certList[0];
 
-    // const encoder = new TextEncoder();
-    // const decoder = new TextDecoder();
-    ////for (const cert of certList)
-    // {
-    //   const p = new Deno.Command("openssl", 
-    //   { 
-    //     args: "x509 -noout -text".split(" "), 
-    //     stdout: "piped",
-    //     stdin: "piped" ,
-    //     stderr: "piped",
-    //   }).spawn();
-    
-    //   const stderrReader = p.stderr.getReader();
-    //   stderrReader.read().then(x => { if (!x.done) console.log("CERT ERROR:", decoder.decode(x.value)); });
-    
-    //   const writer = p.stdin.getWriter();
-    //   await writer.write(encoder.encode(cert));
-    //   await writer.close();
-    
-    //   const reader = p.stdout.getReader();
-    //   const r = await reader.read();
-    
-    //   if (!r.done)
-    //     console.log("CERT!", decoder.decode((r).value));
-    // }
-  
     return cert;
   }
 
 
-  private async newChallenge(token: string, keyAuth: string, challengeUrl: string)
+  abstract newChallenges(domain: Domain, auths: Auth[]): Promise<void>;
+
+
+} // class ACME
+
+
+class ACMECloudflare extends ACMEBase
+{
+  private bearer: string;
+
+
+  public constructor(bearer: string, accountKeys: JoseAccountKeys,
+    domains: Domain[], acmeDirectoryUrl: string, email?: string, csrInfo?: CSRInfo)
   {
-    console.debug("challe..");
+    super("dns-01", accountKeys, domains, acmeDirectoryUrl, email, csrInfo);
 
-    const controller = new AbortController();
-    const signal = controller.signal;
-
-    let _resolve: () => void;
-    const promise: Promise<void> = new Promise((resolve) => _resolve = resolve);
+    this.bearer = bearer
+  }
 
 
-    // TODO: don't use serve
-    serve((request: Request): Response =>
+  async newChallenges(domain: Domain, auths: Auth[])
+  {
+    //console.log("> newChallenges: " + auths.length);
+
+    // find zone id of given zone
+    const cloudflareZoneId = await (async (cloudflareZone) =>
     {
-      console.log("!!!");
-      if (!request.url.endsWith("/.well-known/acme-challenge/" + token))
-        return new Response(null, { status: 400 });
-  
-      _resolve();
-  
-      return new Response(keyAuth, { status: 200, headers: { "content-type": "application/octet-stream" } });
-    }, 
-    { 
-      hostname: "0.0.0.0", 
-      port: 80, 
-      signal: signal, 
-      onListen: () => {} 
-    }); // NOTE: event loop now active!
+      const rep = await fetch(`https://api.cloudflare.com/client/v4/zones`,
+        {
+          method: "GET",
+          headers:
+          {
+            "authorization": "Bearer " + this.bearer,
+          },
+        });
+
+      if (rep.status !== 200)
+      {
+        throw new Error(`Unable to find Zone id from zone (http status '${rep.status}'): ${await rep.json()}`);
+      }
+
+      const json = await rep.json();
+
+      const result = getValueFromJson("result", json) as { id: string, name: string }[];
+
+      for (const entry of result)
+      {
+        const id = getStringFromJson("id", entry);
+        const name = getStringFromJson("name", entry);
+
+        // maybe the name is a subdomain inside that zone... going back one full-stop at a time
+        const fullStops = cloudflareZone.split(".");
+        while (fullStops.length >= 2)
+        {
+          //console.log("fullStops", fullStops);
+
+          if (name === fullStops.join("."))
+          {
+            return id;
+          }
+
+          fullStops.shift();
+        }
+      }
+
+      // if code came here, the zone was not found
+      throw new Error(`Unable to find zone id for zone '${cloudflareZone}' with the given bearer. Does the zone with that name exist and does the bearer have access to that zone?`);
+    })(domain.domainName);
 
 
-    console.log("webserver started, starting challenge...");
-
-    //console.log(
-    await this.post(challengeUrl, {})
-    //  );
-    ;
-
-    console.log("waiting for acme server to make a request... (timeout: 10 seconds)");
+    const dnsRecordIds: string[] = [];
     try
     {
-      await promiseWithTimeout(promise, 10 * 1000); // waiting for http request from letsencrypt ..
+      for (const auth of auths)
+      {
+        //console.log("auth... with challenge url", auth.challengeUrl);
 
-      console.log("first request received by acme server, waiting 4 seconds...");
-      await waitSeconds(4);  
+        const dnsNames: string[] = [ domain.domainName, ...(domain.subdomains || []) ];
+
+        const keyAuthData = new TextEncoder().encode(auth.keyAuth);
+        const keyAuthHash = await crypto.subtle.digest('SHA-256', keyAuthData);
+        const txtRecordContent = encodeBase64Url(keyAuthHash);
+
+        // create txt records on cloudflare
+        for (const dnsName of dnsNames)
+        {
+          const rep = await fetch(`https://api.cloudflare.com/client/v4/zones/${cloudflareZoneId}/dns_records`,
+          {
+            method: "POST",
+            body: JSON.stringify(
+              {
+                content: txtRecordContent,
+                name: "_acme-challenge." + dnsName,
+                proxied: false,
+                type: "TXT",
+                comment: "temporary acme challenge, created by deno-acme at " + new Date().toISOString(),
+                ttl: 60,
+              }),
+            headers:
+            {
+              "authorization": "Bearer " + this.bearer,
+              "content-type": "application/json",
+            },
+          });
+
+          if (rep.status !== 200)
+          {
+            throw new Error(`Failed to create dns record at cloudflare (http status '${rep.status}'): ${JSON.stringify(await rep.json())}`);
+          }
+
+          const json = await rep.json();
+
+          const id = getStringFromJson("id", getValueFromJson("result", json) as Record<string, unknown>);
+
+          dnsRecordIds.push(id);
+
+          //console.log("cloudflare create dns record success", json.result.id);//, json);
+        }
+
+        //console.log("all cloudflare dns records created");
+      }
+
+
+      // all auths done, now waiting for the order to be processed
+      //console.log("giving the acme server time (10s) to catch up...");
+      //await waitSeconds(10);
+
+
+      // fire all challenges
+      for (const auth of auths)
+      {
+        // tell acme server that the challenge has been solved
+        //console.log("post challenge", auth.challengeUrl);
+
+        //const challengeResult =
+        await this.post(auth.challengeUrl, {});
+
+        //const challengeJson = await challengeResult.json();
+        //console.log("challenge json", challengeJson, "http status", challengeResult.status);
+
+        //const challengeStatus = getStringFromJson("status", challengeJson);
+
+        //console.log("challengeStatus", challengeStatus);//, "token:", json.token, "given token:", auth.token);
+      //}
+
+        // TODO: if 'status' already 'valid' - directly finalize
+
+
+        // all challenged done, now waiting for the order to be processed
+        //console.log("waiting for acme server do all its dns checks...");
+
+        // console.log("waiting 20 seconds...");
+        // await waitSeconds(20); // TODO: respect 'Retry-After' header
+
+        //console.log("post AUTH", auth.authUrl);
+        const authStatus = await this.post(auth.authUrl);
+
+        // if (!authStatus.ok)
+        // {
+        //   throw new Error("Order status check failed: " + JSON.stringify(await authStatus.json()));
+        // }
+
+        const authJson = await authStatus.json();
+        //console.log("authJson", authJson);
+
+        const status = getStringFromJson("status", authJson);
+
+        //console.log("status", status);
+
+        if (!["pending", "valid"].includes(status))
+        {
+          throw new Error(`response auth status not 'pending' or 'valid', but '${status}': response: ${JSON.stringify(authJson)}`); // TODO: error message instead of whole json
+        }
+      }
     }
-    catch(e)
+    catch (err)
     {
-      throw new Error("letsencrypt didn't answer in 7 seconds: " + e);
+      console.error("one auth failed - giving up", err);
+      throw err;
     }
     finally
     {
-      controller.abort(); // aka. close webserver
-      console.log("waiting 2 seconds for the server to stop listening...");
-      await waitSeconds(4);  
+      for (const dnsRecordId of dnsRecordIds)
+      {
+        try
+        {
+          const rep = await fetch(`https://api.cloudflare.com/client/v4/zones/${cloudflareZoneId}/dns_records/${dnsRecordId}`,
+          {
+            method: "DELETE",
+            headers:
+            {
+              "authorization": "Bearer " + this.bearer,
+            },
+          });
+
+          if (rep.status !== 200)
+          {
+            console.error(`cloudflare failed to delete temporary acme challege (http status '${rep.status}'): ${await rep.json()}`);
+          }
+        }
+        catch (err)
+        {
+          console.error("failed to delete temporary acme challenge from cloudflare - you have to delete it manually", err);
+        }
+      }
+    }
+
+    //console.log("all auths done");
+  }
+}
+
+
+class ACMEHttp extends ACMEBase
+{
+  public constructor(accountKeys: JoseAccountKeys,
+    domains: Domain[], acmeDirectoryUrl: string, email?: string, csrInfo?: CSRInfo)
+  {
+    super("http-01", accountKeys, domains, acmeDirectoryUrl, email, csrInfo);
+  }
+
+
+  async newChallenges(_domain: Domain, auths: Auth[])
+  {
+    // TODO: check order status....
+
+    // TODO: one webserver for all auths
+    for (const auth of auths)
+    {
+      const { token, keyAuth, challengeUrl } = auth;
+
+      const controller = new AbortController();
+      const signal = controller.signal;
+
+      let _resolve: () => void;
+      const promise: Promise<void> = new Promise((resolve) => _resolve = resolve);
+
+
+      // TODO: don't use serve
+      serve((request: Request): Response =>
+      {
+        //console.log("!!!");
+        if (!request.url.endsWith("/.well-known/acme-challenge/" + token))
+          return new Response(null, { status: 400 });
+
+        _resolve();
+
+        return new Response(keyAuth, { status: 200, headers: { "content-type": "application/octet-stream" } });
+      },
+      {
+        hostname: "0.0.0.0",
+        port: 80,
+        signal: signal,
+        onListen: () => {}
+      }); // NOTE: event loop now active!
+
+
+      //console.log("webserver started, starting challenge...");
+
+      //console.log(
+      await this.post(challengeUrl, {})
+      //  );
+      ;
+
+      //console.log("waiting for acme server to make a request... (timeout: 10 seconds)");
+      try
+      {
+        await promiseWithTimeout(promise, 10 * 1000); // waiting for http request from letsencrypt ..
+
+        //console.log("first request received by acme server, waiting 4 seconds...");
+        await waitSeconds(4);
+      }
+      catch(e)
+      {
+        throw new Error("letsencrypt didn't answer in 7 seconds: " + e);
+      }
+      finally
+      {
+        controller.abort(); // aka. close webserver
+        //console.log("waiting 2 seconds for the server to stop listening...");
+        await waitSeconds(4);
+      }
     }
   }
-} // class ACME
+}
 
 
 async function promiseWithTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<unknown>
 {
   let timeoutTimer: ReturnType<typeof setTimeout>;
 
-  const timeoutPromise = new Promise((_, reject) => 
+  const timeoutPromise = new Promise((_, reject) =>
   {
     timeoutTimer = setTimeout(() => { reject(new Error("Timeout exceeded!")); }, timeoutMs);
   });
 
-  return await Promise.race([promise, timeoutPromise]) 
-    .finally(() => 
+  return await Promise.race([promise, timeoutPromise])
+    .finally(() =>
     {
       clearTimeout(timeoutTimer);
     });
@@ -481,6 +758,32 @@ async function checkResponseStatus(res: Response, ...expectedStatus: number[])
 }
 
 
+function getStringFromJson(key: string, json: Record<string, unknown>): string
+{
+  const val = getValueFromJson(key, json);
+
+  if (typeof(val) !== "string")
+  {
+    throw new Error(`getStringFromJson: value for key '${key}' is not of type 'string'! Type is '${typeof(val)}'`);
+  }
+
+  return val as string;
+}
+
+
+// function getNumberFromJson(key: string, json: Record<string, unknown>): number
+// {
+//   const val = getValueFromJson(key, json);
+
+//   if (typeof(val) !== "number")
+//   {
+//     throw new Error(`getNumberFromJson: value for key '${key}' is not of type 'number'! Type is '${typeof(val)}'`);
+//   }
+
+//   return val as number;
+// }
+
+
 function getValueFromJson(key: string, json: Record<string, unknown>): unknown
 {
   if (!(key in json))
@@ -489,10 +792,11 @@ function getValueFromJson(key: string, json: Record<string, unknown>): unknown
 }
 
 
-function checkUrl(url: string): void
+function checkUrl(url: string): string
 {
   if (!url.startsWith("https://"))
     throw new Error(`checkUrl: not a https link: '${url}'`);
+  return url;
 }
 
 
