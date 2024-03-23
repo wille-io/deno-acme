@@ -1,3 +1,5 @@
 *.crt
 *.pem
 deno.lock
+.deno-acme/
+.DS_Store

@@ -1,33 +1,36 @@
-import * as jose from "https://deno.land/x/jose@v4.14.4/index.ts";
-import { serve } from "https://deno.land/std@0.193.0/http/server.ts";
+import * as jose from "https://deno.land/x/jose@v5.2.3/index.ts";
 import { KJUR, KEYUTIL } from "npm:jsrsasign";
+import { serve } from "https://deno.land/std@0.193.0/http/server.ts";
 import { encode as encodeBase64Url } from "https://deno.land/std@0.193.0/encoding/base64url.ts";
 import { decode as decodeHex } from "https://deno.land/std@0.193.0/encoding/hex.ts";
 
 
-type JoseAccountKeys = { publicKey: jose.KeyLike, privateKey: jose.KeyLike, exists: boolean };
-
-
-// exports
-
-
 export interface Domain { domainName: string, subdomains?: string[] };
 export type DomainCertificate = { domainName: string, subdomains?: string[], pemCertificate: string, pemPublicKey: string, pemPrivateKey: string };
-export type AccountKeys = { pemPublicKey: string, pemPrivateKey: string };
-
-
-async function getAccountKeys(pemAccountKeys?: AccountKeys)
+export type AccountKeys = { privateKeyPEM: string, publicKeyPEM: string };
+export interface CSRInfo
 {
-  if (pemAccountKeys)
-  {
-    return {
-      publicKey: await jose.importSPKI(pemAccountKeys.pemPublicKey, "ES256", { extractable: true }),
-      privateKey: await jose.importPKCS8(pemAccountKeys.pemPrivateKey, "ES256", { extractable: true }),
-      exists: true,
-    } satisfies JoseAccountKeys;
-  }
+  countryCode: string;
+  organization: string;
+}
 
-  return { ...(await jose.generateKeyPair('ES256', { extractable: true })), exists: false } satisfies JoseAccountKeys;
+enum ACMEStatus
+{
+  pending = "pending",
+  processing = "processing",
+  valid = "valid",
+}
+type Nonce = string;
+type AcmeDirectoryUrls = { newAccount: string, newNonce: string, newOrder: string };
+type Auth = { challengeUrl: string, keyAuth: string, token: string, authUrl: string };
+type Kid = string;
+
+
+async function createSession(acmeDirectoryUrl: string, options?: { pemAccountKeys?: AccountKeys, email?: string }): Promise<ACMESession>
+{
+  return (options?.pemAccountKeys)
+    ? await ACMESession.login(options.pemAccountKeys.privateKeyPEM, options.pemAccountKeys.publicKeyPEM, acmeDirectoryUrl)
+    : await ACMESession.register(acmeDirectoryUrl, options?.email);
 }
 
 
@@ -44,7 +47,11 @@ export async function getCertificatesWithHttp(domains: Domain[], acmeDirectoryUr
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
   : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
 {
-  return new ACMEHttp(await getAccountKeys(options?.pemAccountKeys), domains, acmeDirectoryUrl, options?.yourEmail, options?.csrInfo).getCertificates();
+  const session = await createSession(acmeDirectoryUrl, { pemAccountKeys: options?.pemAccountKeys, email: options?.yourEmail });
+  return {
+    domainCertificates: await new ACMEHttp(session, domains, options?.yourEmail, options?.csrInfo).getCertificates(),
+    pemAccountKeys: await session.exportAccount(),
+  };
 }
 
 
@@ -61,23 +68,12 @@ export async function getCertificatesWithCloudflare(bearer: string, domains: Dom
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
   : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
 {
-  return new ACMECloudflare(bearer, await getAccountKeys(options?.pemAccountKeys), domains, acmeDirectoryUrl, options?.yourEmail, options?.csrInfo).getCertificates();
+  const session = await createSession(acmeDirectoryUrl, { pemAccountKeys: options?.pemAccountKeys, email: options?.yourEmail });
+  return {
+    domainCertificates: await new ACMECloudflare(bearer, session, domains, options?.yourEmail, options?.csrInfo).getCertificates(),
+    pemAccountKeys: await session.exportAccount(),
+  };
 }
-
-
-export interface CSRInfo
-{
-  countryCode: string;
-  organization: string;
-}
-
-
-// end of exports
-
-
-type Nonce = string;
-type AcmeDirectoryUrls = { newAccount: string, newNonce: string, newOrder: string };
-type Auth = { challengeUrl: string, keyAuth: string, token: string, authUrl: string };
 
 
 function orError(message: string): never
@@ -86,45 +82,398 @@ function orError(message: string): never
 }
 
 
+function stringToNumberOrNull(value: string | null): number | null
+{
+  if (!value)
+  {
+    return null;
+  }
+  const ret = Number(value);
+  return (isNaN(ret) ? null : ret);
+}
+
+
+class ACMEAccount
+{
+  public privateKey: jose.KeyLike;
+  public publicKey: jose.KeyLike;
+  public publicKeyJWK: jose.JWK;
+  public kid: Kid;
+
+  public async exportAccount(): Promise<AccountKeys>
+  {
+    return { privateKeyPEM: await jose.exportPKCS8(this.privateKey), publicKeyPEM: await jose.exportSPKI(this.publicKey) };
+  }
+
+  public constructor(privateKey: jose.KeyLike, publicKey: jose.KeyLike, publicKeyJWK: jose.JWK, kid: Kid)
+  {
+    this.privateKey = privateKey;
+    this.publicKey = publicKey;
+    this.publicKeyJWK = publicKeyJWK;
+    this.kid = kid;
+  }
+}
+
+
+
+export class ACMESession
+{
+  private nonce: string;
+  private account: ACMEAccount;
+  private acmeDirectoryUrls: AcmeDirectoryUrls;
+
+
+  public jwk(): jose.JWK
+  {
+    return this.account.publicKeyJWK;
+  }
+
+
+  public directory(): AcmeDirectoryUrls
+  {
+    return this.acmeDirectoryUrls; // TODO: copy
+  }
+
+
+  public exportAccount(): Promise<AccountKeys>
+  {
+    return this.account.exportAccount();
+  }
+
+
+  private static async processAcmeDirectory(acmeDirectoryUrl: string): Promise<AcmeDirectoryUrls>
+  {
+    const res = await fetch(acmeDirectoryUrl);
+    await checkResponseStatus(res, 200);
+    const urls : AcmeDirectoryUrls = await res.json();
+
+    const acmeDirectoryUrls: AcmeDirectoryUrls =
+    {
+      newNonce: getStringFromJson("newNonce", urls),
+      newAccount: getStringFromJson("newAccount", urls),
+      newOrder: getStringFromJson("newOrder", urls),
+    };
+
+    console.log("acmeDirectoryUrls", acmeDirectoryUrls);
+    return acmeDirectoryUrls;
+  }
+
+
+  private static async getNonce(url: string): Promise<Nonce>
+  {
+    console.debug("getNonce");
+    const res = await fetch(url,
+    {
+      method: "HEAD",
+    });
+
+    await checkResponseStatus(res, 200);
+
+    const nonce = getNonceFromResponse(res);
+    console.debug("nonce", nonce);
+    return nonce;
+  }
+
+
+  private constructor(currentNonce: Nonce, account: ACMEAccount, acmeDirectoryUrls: AcmeDirectoryUrls)
+  {
+    this.nonce = currentNonce;
+    this.account = account;
+    this.acmeDirectoryUrls = acmeDirectoryUrls;
+  }
+
+
+  public static async login(privateKeyPEM: string, publicKeyPEM: string, acmeDirectoryUrl: string): Promise<ACMESession>
+  {
+    console.debug("login");
+
+    const privateKey = await jose.importPKCS8(privateKeyPEM, "ES256", { extractable: true }); // TODO: false?
+    const publicKey = await jose.importSPKI(publicKeyPEM, "ES256", { extractable: true }); // s.a.a.
+
+    const jwk = await jose.exportJWK(publicKey);
+    const acmeDirectoryUrls: AcmeDirectoryUrls = await this.processAcmeDirectory(acmeDirectoryUrl);
+    const fistNonce = await this.getNonce(acmeDirectoryUrls.newNonce);
+
+    const { nonce, res } = await this.purePost(fistNonce, acmeDirectoryUrls.newAccount, privateKey,
+      {
+        payload:
+        {
+          onlyReturnExisting: true
+        },
+        additionalProtectedHeaderValues: { jwk },
+        expectedStatus: 200,
+        expectedAcmeStatus: ACMEStatus.valid,
+      }
+    );
+
+    // TODO: 7.3.3. ?
+
+    const kid = getHeaderFromResponse(res, "location");
+    console.debug("kid", kid);
+
+    return new ACMESession(nonce, new ACMEAccount(privateKey, publicKey, jwk, kid), acmeDirectoryUrls);
+  }
+
+  public static async register(acmeDirectoryUrl: string, email?: string): Promise<ACMESession>
+  {
+    console.debug("register");
+
+    const { privateKey, publicKey } = await jose.generateKeyPair("ES256", { extractable: true });
+
+    const jwk = await jose.exportJWK(publicKey);
+    const acmeDirectoryUrls: AcmeDirectoryUrls = await this.processAcmeDirectory(acmeDirectoryUrl);
+    const firstNonce = await this.getNonce(acmeDirectoryUrls.newNonce);
+
+    const { res, nonce } = await this.purePost(firstNonce, acmeDirectoryUrls.newAccount, privateKey,
+      {
+        payload:
+        {
+          termsOfServiceAgreed: true,
+          contact: (email ? [ `mailto:${email}`, ] : null),
+        },
+        additionalProtectedHeaderValues: { jwk },
+        expectedStatus: 201,
+        expectedAcmeStatus: ACMEStatus.valid,
+      }
+    );
+
+    const kid = getHeaderFromResponse(res, "location");
+    console.debug("kid", kid);
+
+    return new ACMESession(nonce, new ACMEAccount( privateKey, publicKey, jwk, kid), acmeDirectoryUrls);
+  }
+
+
+  protected static async purePost(nonce: Nonce, url: string, privateKey: jose.KeyLike,
+    options?: { kid?: Kid, payload?: string | Record<string, unknown>,
+    expectedStatus?: number | number[], additionalProtectedHeaderValues?: Record<string, unknown>,
+    expectedAcmeStatus?: ACMEStatus | ACMEStatus[] })
+    : Promise<{ res: Response, nonce: Nonce }>
+  {
+    const payload = options?.payload || "";
+    const expectedStatus = (options?.expectedStatus !== undefined) ? options?.expectedStatus : 200;
+    const payloadString = (typeof(payload) === "string") ? payload : JSON.stringify(payload);
+
+    const header =
+    {
+      alg: 'ES256',
+      b64: true,
+      nonce,
+      url,
+      ...(options?.kid ? { kid: options.kid } : {}),
+      ...options?.additionalProtectedHeaderValues,
+    };
+
+    console.debug("header", header);
+
+    const jws = await new jose.FlattenedSign(
+      new TextEncoder().encode(payloadString))
+        .setProtectedHeader(header)
+        .sign(privateKey);
+
+
+    console.debug("post", url);
+
+
+    // TODO: deactivate me after debugging:
+    /* cut here */
+    const res = await (async (url: string, jws: unknown) =>
+    {
+    // stop here */
+    const res = await fetch(url,
+      {
+        method: "POST",
+        headers:
+        {
+          "Content-Type": "application/jose+json",
+        },
+        body: JSON.stringify(jws),
+      }
+    );
+    /* cut here */
+    const clone = res.clone();
+
+    if (["application/json","application/problem+json"].includes(getHeaderFromResponse(res, "content-type").toLowerCase()))
+    {
+      console.debug("json", await res.json());
+    }
+    else
+    {
+      console.debug("text", await res.text());
+    }
+    return clone;
+    })(url, jws);
+    // stop here */
+
+
+    console.debug("res", res.headers, res.statusText);
+
+    nonce = getNonceFromResponse(res);
+    console.debug("nonce", nonce);
+
+    const contentType = getHeaderFromResponse(res, "content-type").toLowerCase();
+    console.debug("contentType", contentType);
+
+    if (contentType === "application/pem-certificate-chain") // downloading cert
+    {
+      return { res, nonce };
+    }
+
+    if (contentType !== "application/json")
+    {
+      if (contentType === "application/problem+json")
+      {
+        const json = await res.json();
+        throw new Error(`acme server sent an error (with http status ${res.status}): \r\nType: ${ getValueFromJsonOrNull("type", json) || orError("<UNKNOWN>") } \r\nDetails: ${ getValueFromJsonOrNull("detail", json) }`);
+      }
+
+      throw new Error(`acme server sent malformed non-json response! '${await res.text()}'`);
+    }
+
+    await checkResponseStatus(res, ...(Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus]));
+
+    if (options?.expectedAcmeStatus)
+    {
+      const expectedAcmeStatus = (Array.isArray(options.expectedAcmeStatus) ? options.expectedAcmeStatus : [options.expectedAcmeStatus]).map((status) => status as string);
+
+      const clone = res.clone();
+
+      const json = await res.json();
+      const status = getStringFromJson("status", json);
+
+      if (!expectedAcmeStatus.includes(status))
+      {
+        throw new Error(`acme server answered with status '${status}', but '${expectedAcmeStatus.join("', '")}' was expected! ${JSON.stringify(json)}`);
+      }
+
+      return { res: clone, nonce };
+    }
+
+    return { res, nonce };
+  }
+
+
+  public async post(url: string, options?: { payload?: string | Record<string, unknown>,
+    expectedStatus?: number | number[], additionalProtectedHeaderValues?: Record<string, unknown>,
+    expectedAcmeStatus?: ACMEStatus | ACMEStatus[],
+    waitForAcmeStatus?: boolean })
+    : Promise<Response>
+  {
+    const maxWaitTime = 80;
+    let waitTime = 0;
+    const wait = !!options?.waitForAcmeStatus;
+
+    do
+    {
+      if (waitTime >= maxWaitTime)
+      {
+        throw new Error(`acme server didn't change status after polling for ${waitTime} seconds - giving up`);
+      }
+
+      const { nonce, res } = await ACMESession.purePost(this.nonce, url, this.account.privateKey,
+        {
+          kid: this.account.kid,
+          ...options,
+        });
+      this.nonce = nonce;
+
+
+      // already done by purePost
+      // const clone = res.clone();
+      // const json = await res.json();
+
+      // const status = getStringFromJson("status", json);
+
+      // if (status === "invalid")
+      // {
+      //   throw new Error("acme server answered with status 'invalid'! " + JSON.stringify(json));
+      // }
+
+
+      if (options?.waitForAcmeStatus)
+      {
+        const clone = res.clone();
+        const json = await res.json();
+
+        const status = getStringFromJson("status", json);
+
+        // already done by purePost
+        // if (status === "invalid")
+        // {
+        //   throw new Error("acme server answered with status 'invalid'! " + JSON.stringify(json));
+        // }
+
+        if (["pending", "processing"].includes(status)) // TODO: special 'pending' handling?
+        {
+          const retryAfter = stringToNumberOrNull(res.headers.get("retry-after")) || 2;
+          console.debug("retry-after = ", retryAfter);
+          console.log(`acme status is '${status}' - trying again in ${retryAfter} seconds`);
+          waitTime += retryAfter;
+          await waitSeconds(retryAfter);
+          continue;
+        }
+
+        if (status === "valid")
+        {
+          return clone;
+        }
+
+        throw new Error("acme server sent unknown status! " + status);
+      }
+
+      return res;
+    }
+    while (wait);
+
+    // deno-lint-ignore no-unreachable
+    throw new Error(""); // deno lint either wants an (unreachable) ending return or an unknown return type
+  }
+}
+
+
 abstract class ACMEBase
 {
-  public constructor(challengeType: string, accountKeys: JoseAccountKeys,
-    domains: Domain[], acmeDirectoryUrl: string, email?: string, csrInfo?: CSRInfo)
+  protected session: ACMESession;
+  protected email: string | undefined;
+  protected domains: Domain[];
+  protected csr: CSRInfo | undefined;
+  protected challengeType: string;
+
+
+  public constructor(challengeType: string, session: ACMESession,
+    domains: Domain[], email?: string, csrInfo?: CSRInfo)
   {
-    this.nonce = null;
-    this.accountKeys = accountKeys;
+    this.session = session;
     this.email = email;
-    this.kid = null;
     this.domains = domains;
-    this.acmeDirectoryUrl = acmeDirectoryUrl;
     this.csr = csrInfo;// || { countryCode: "US", organization: "deno-acme" };
     this.challengeType = challengeType;
   }
 
 
   public async getCertificates()
-    : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
+    : Promise<DomainCertificate[]>
   {
-    const acmeDirectoryUrls: AcmeDirectoryUrls = await this.processAcmeDirectory();
-
-    await this.getNonce(acmeDirectoryUrls.newNonce);
-    const jwk = await this.createAccount(acmeDirectoryUrls.newAccount);
-
     const domainCertificates: DomainCertificate[] = [];
 
     for (const domain of this.domains)
     {
       try
       {
-        const { finalizeUrl, authUrls, orderUrl } = await this.newOrder(domain, acmeDirectoryUrls.newOrder);
+        const { finalizeUrl, authUrls, orderUrl } = await this.newOrder(domain);
 
         const auths: Auth[] = [];
         for (const authUrl of authUrls)
         {
-          auths.push(await this.newAuth(authUrl, jwk));
+          auths.push(await this.newAuth(authUrl));
         }
 
         await this.newChallenges(domain, auths);
+
+        // check order
+        const x = await this.session.post(orderUrl);
+        console.debug("order", await x.json());
+
 
         const { domainPublicKey, domainPrivateKey } = await this.newFinalize(domain, finalizeUrl);
         const { certificateUrl } = await this.newReorder(orderUrl);
@@ -142,118 +491,38 @@ abstract class ACMEBase
       catch(e)
       {
         // get all other domains if one fails
-        console.error(`ACME: failed to order certificate for domain '${domain.domainName}': ${e}`);
+        console.error(`ACME: failed to order certificate for domain '${domain.domainName}': \r\n${e}`);
         //throw e;
       }
     }
 
-
-    const pemAccountKeys: AccountKeys =
-      {
-        pemPublicKey: await jose.exportSPKI(this.accountKeys.publicKey),
-        pemPrivateKey: await jose.exportPKCS8(this.accountKeys.privateKey),
-      };
-
-    return { domainCertificates, pemAccountKeys };
+    return domainCertificates;
   }
 
 
-  // private
-  private nonce: Nonce | null;
-  private accountKeys: JoseAccountKeys;
-  private email: string | undefined;
-  private kid: string | null;
-  private domains: Domain[];
-  private acmeDirectoryUrl: string;
-  private csr: CSRInfo | undefined;
-  private challengeType: string;
-
-
-  private async processAcmeDirectory()
+  private async newAuth(authUrl: string): Promise<Auth>
   {
-    const res = await fetch(this.acmeDirectoryUrl);
-    await checkResponseStatus(res, 200);
-    //console.log("this.acmeDirectoryUrls", this.acmeDirectoryUrls);
-    return await res.json() as AcmeDirectoryUrls;
-  }
+    console.debug("> newAuth");
 
-
-  protected async post(url: string, payload: string | Record<string, unknown> = "",
-    expectedStatus: number | number[] = 200, additionalProtectedHeaderValues?: Record<string, unknown>)
-    : Promise<Response>
-  {
-    const payloadString = (typeof(payload) === "string") ? payload : JSON.stringify(payload);
-
-    const jws = await new jose.FlattenedSign(
-      new TextEncoder().encode(payloadString))
-        .setProtectedHeader(
-        {
-          alg: 'ES256',
-          b64: true,
-          nonce: this.nonce,
-          url: url,
-          ...(this.kid ? { kid: this.kid } : {}),
-          ...additionalProtectedHeaderValues,
-        })
-        .sign(this.accountKeys.privateKey);
-
-    const res = await fetch(url,
-      {
-        method: "POST",
-        headers:
-        {
-          "Content-Type": "application/jose+json",
-        },
-        body: JSON.stringify(jws),
-      });
-
-    await checkResponseStatus(res, ...(Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus])); //Array.isArray(expectedStatus) ? expectedStatus as number[] : [expectedStatus as number]);
-
-    this.nonce = getNonceFromResponse(res);
-
-    //console.log("post", url, res.headers, res.statusText);
-
-    return res;
-  }
-
-
-  private async getNonce(url: string)
-  {
-    //console.debug("> nonce");
-    const res = await fetch(url,
-    {
-      method: "HEAD",
-    });
-
-    await checkResponseStatus(res, 200);
-
-    this.nonce = getNonceFromResponse(res);
-  }
-
-
-  private async newAuth(authUrl: string, jwk: jose.JWK): Promise<Auth>
-  {
-    //console.debug("> newAuth");
-
-    //console.log("post auth", authUrl);
-    const res = await this.post(authUrl);
+    console.debug("post auth", authUrl);
+    const res = await this.session.post(authUrl, { expectedAcmeStatus: [ ACMEStatus.pending, ACMEStatus.valid ] });
 
     const json = await res.json();
-    //console.log("auth json", json);
+    console.debug("auth json", json);
 
-    const status = getStringFromJson("status", json);
+    // const status = getStringFromJson("status", json);
 
-    if (!["pending", "valid"].includes(status))
-    {
-      throw new Error(`order status not 'valid' or 'pending', but '${status}' - response: ${JSON.stringify(json)}`); // TODO: error message instead of full json
-    }
+    // if (!["pending", "valid"].includes(status))
+    // {
+    //   throw new Error(`order status not 'valid' or 'pending', but '${status}' - response: ${JSON.stringify(json)}`); // TODO: error message instead of full json
+    // }
 
     type Challenge = { type: string, url: string, token: string };
     const challenges: Challenge[] = getValueFromJson("challenges", json) as Challenge[];
-    //console.log("challenges", challenges);
+    console.debug("challenges", challenges);
 
     const challenge = challenges.find(obj => obj.type === this.challengeType);
-    //console.log("chosen challenge", challenge);
+    console.debug("selected challenge", challenge);
 
     if (!challenge)
     {
@@ -269,15 +538,15 @@ abstract class ACMEBase
       throw new Error(`newAuth: no suitable token in ${this.challengeType} challenge received from acme server!`);
     }
 
-    const keyAuth = challenge.token + '.' + await jose.calculateJwkThumbprint(jwk);
+    const keyAuth = challenge.token + '.' + await jose.calculateJwkThumbprint(this.session.jwk());
 
     return { challengeUrl: challenge.url, keyAuth: keyAuth, token: challenge.token, authUrl };
   }
 
 
-  private async newOrder(domain: Domain, url: string)
+  private async newOrder(domain: Domain)
   {
-    //console.debug("> newOrder");
+    console.debug("> newOrder");
 
     const domainName = domain.domainName;
 
@@ -288,10 +557,14 @@ abstract class ACMEBase
     ];
 
     //console.log("post new order", url);
-    const res = await this.post(url,
+    const res = await this.session.post(this.session.directory().newOrder,
       {
-        "identifiers": identifiersArray,
-      }, 201);
+        payload:
+        {
+          identifiers: identifiersArray,
+        },
+        expectedStatus: 201,
+      });
 
     const orderUrl = checkUrl(res.headers.get("Location") || orError("Location header missing"));
     //console.log("orderUrl (from Location header)", orderUrl);
@@ -312,53 +585,28 @@ abstract class ACMEBase
   }
 
 
-  private async createAccount(url: string)//: Promise<void>
-  {
-    //console.debug("create account.. exists?", this.accountKeys.exists);
-
-    const jwk = await jose.exportJWK(this.accountKeys.publicKey);
-
-    // TODO: 7.3.3. ?
-
-    const res = await this.post(url,
-      {
-        ...(this.accountKeys.exists ?
-          {
-            onlyReturnExisting: true
-          }
-          :
-          {
-            termsOfServiceAgreed: true,
-            contact: (this.email ? [ `mailto:${this.email}`, ] : null),
-          }
-        )
-      },
-      (this.accountKeys.exists ? 200 : 201), { jwk });
-
-    this.kid = getHeaderFromResponse(res, "location");
-    //console.debug("kid", this.kid);
-
-    return jwk;
-  }
-
-
   private async newReorder(orderUrl: string)
   {
-    //console.debug("> reorder");
+    console.debug("> reorder");
 
-    const res = await this.post(orderUrl);
+    const res = await this.session.post(orderUrl,
+      {
+        expectedAcmeStatus: [ ACMEStatus.processing, ACMEStatus.valid ],
+        waitForAcmeStatus: true
+      }
+    );
     const json = await res.json();
     const certificateUrl = getStringFromJson("certificate", json) as string;
 
     checkUrl(certificateUrl);
 
-    return { certificateUrl: certificateUrl };
+    return { certificateUrl };
   }
 
 
   private async newFinalize(domain: Domain, finalizeUrl: string)
   {
-    //console.debug("> finalize");
+    console.debug("> finalize");
     const { publicKey, privateKey } = await jose.generateKeyPair('ES256', { extractable: true }); // keys for the csr and the to-be requested certificate(s)
 
     const spkiPemPubCSR = await jose.exportSPKI(publicKey);
@@ -390,33 +638,32 @@ abstract class ACMEBase
     const csrDer = encodeBase64Url(csrDerHexRaw);
 
 
-    const res = await this.post(finalizeUrl, { csr: csrDer });
-    const json = await res.json();
-    const status = getStringFromJson("status", json) as string;
+    const res = await this.session.post(finalizeUrl,
+      {
+        payload:
+        {
+          csr: csrDer
+        },
+        expectedAcmeStatus: [ ACMEStatus.processing, ACMEStatus.valid ],
+        //waitForAcmeStatus: true
+      }
+    );
 
-    if (["invalid", "pending"].includes(status))
-    {
-      throw new Error(`newFinalize: acme server answered with status 'invalid' or 'pending': '${json}' - headers: '${res.headers}'`);
-    }
+    // const json = await res.json();
+    // const status = getStringFromJson("status", json) as string;
 
     // pending means: 'The server does not believe that the client has fulfilled the requirements.' see https://datatracker.ietf.org/doc/html/rfc8555#section-7.4
     // TODO: be able to re-do challenges on pending?
 
-    const certificateReady = (status === "valid"); // VERY unlikely
+    //const certificateReady = (status === "valid"); // VERY unlikely
+    // TODO: finalize if already valid
 
     // so status is valid or processing
 
     const orderUrl = getHeaderFromResponse(res, "location");
+    console.debug("orderUrl", orderUrl);
 
     checkUrl(orderUrl);
-
-    if (!certificateReady)
-    {
-      const retryAfter: number = (parseInt(res.headers.get("retry-after") || "10") || 10) + 2;
-
-      //console.log(`waiting ${retryAfter} seconds for the acme server to process our certificate...`);
-      await waitSeconds(retryAfter);
-    }
 
     return { orderUrl: orderUrl, domainPublicKey: spkiPemPubCSR,
       domainPrivateKey: pkcs8PemPrvCSR /*, certificateReady: certificateReady*/ };
@@ -425,9 +672,9 @@ abstract class ACMEBase
 
   private async getCert(certificateUrl: string): Promise<string>
   {
-    //console.debug("> cert");
+    console.debug("> cert");
 
-    const res = await this.post(certificateUrl);
+    const res = await this.session.post(certificateUrl);
     const text = await res.text();
     const certList = text.split("-----END CERTIFICATE-----").map(cert => cert + "-----END CERTIFICATE-----");
 
@@ -453,10 +700,10 @@ class ACMECloudflare extends ACMEBase
   private bearer: string;
 
 
-  public constructor(bearer: string, accountKeys: JoseAccountKeys,
-    domains: Domain[], acmeDirectoryUrl: string, email?: string, csrInfo?: CSRInfo)
+  public constructor(bearer: string, session: ACMESession,
+    domains: Domain[], email?: string, csrInfo?: CSRInfo)
   {
-    super("dns-01", accountKeys, domains, acmeDirectoryUrl, email, csrInfo);
+    super("dns-01", session, domains, email, csrInfo);
 
     this.bearer = bearer
   }
@@ -464,11 +711,12 @@ class ACMECloudflare extends ACMEBase
 
   async newChallenges(domain: Domain, auths: Auth[])
   {
-    //console.log("> newChallenges: " + auths.length);
+    console.debug("> newChallenges - count:" + auths.length);
 
     // find zone id of given zone
     const cloudflareZoneId = await (async (cloudflareZone) =>
     {
+      // TODO: search with "name" parameter (site is TLD!)
       const rep = await fetch(`https://api.cloudflare.com/client/v4/zones`,
         {
           method: "GET",
@@ -484,9 +732,11 @@ class ACMECloudflare extends ACMEBase
       }
 
       const json = await rep.json();
+      console.debug("cloudflare zones json", json);
 
       const result = getValueFromJson("result", json) as { id: string, name: string }[];
 
+      // TODO: site is the TLD !
       for (const entry of result)
       {
         const id = getStringFromJson("id", entry);
@@ -517,7 +767,7 @@ class ACMECloudflare extends ACMEBase
     {
       for (const auth of auths)
       {
-        //console.log("auth... with challenge url", auth.challengeUrl);
+        console.debug("auth... with challenge url", auth.challengeUrl);
 
         const dnsNames: string[] = [ domain.domainName, ...(domain.subdomains || []) ];
 
@@ -553,34 +803,39 @@ class ACMECloudflare extends ACMEBase
           }
 
           const json = await rep.json();
+          console.debug("cloudflare create record json", json);
 
           const id = getStringFromJson("id", getValueFromJson("result", json) as Record<string, unknown>);
 
           dnsRecordIds.push(id);
 
-          //console.log("cloudflare create dns record success", json.result.id);//, json);
+          console.log(`cloudflare create dns record for (sub)domain '${dnsName}' success - record content: '${txtRecordContent}' - record id: '${json.result.id}'`);//, json);
         }
 
-        //console.log("all cloudflare dns records created");
+        console.log("all cloudflare dns records created");
       }
 
 
-      // all auths done, now waiting for the order to be processed
-      //console.log("giving the acme server time (10s) to catch up...");
-      //await waitSeconds(10);
+      // creating txt record(s) done - waiting for acme's dns to catch up
+      console.log("giving the acme server time (3s) to catch up...");
+      await waitSeconds(3);
 
 
       // fire all challenges
       for (const auth of auths)
       {
         // tell acme server that the challenge has been solved
-        //console.log("post challenge", auth.challengeUrl);
+        console.log("post challenge", auth.challengeUrl);
 
         //const challengeResult =
-        await this.post(auth.challengeUrl, {});
-
+        await this.session.post(auth.challengeUrl,
+          {
+            payload: {},
+            expectedAcmeStatus: [ ACMEStatus.processing, ACMEStatus.valid, ACMEStatus.pending ],
+            //waitForAcmeStatus: true
+          });
         //const challengeJson = await challengeResult.json();
-        //console.log("challenge json", challengeJson, "http status", challengeResult.status);
+        //console.debug("challenge json", challengeJson, "http status", challengeResult.status);
 
         //const challengeStatus = getStringFromJson("status", challengeJson);
 
@@ -597,24 +852,32 @@ class ACMECloudflare extends ACMEBase
         // await waitSeconds(20); // TODO: respect 'Retry-After' header
 
         //console.log("post AUTH", auth.authUrl);
-        const authStatus = await this.post(auth.authUrl);
+        //const authStatus =
+        await this.session.post(auth.authUrl,
+          {
+            expectedAcmeStatus: [ ACMEStatus.processing, ACMEStatus.valid, ACMEStatus.pending ],
+            waitForAcmeStatus: true
+          }
+        );
+
+        // TODO: try again n times if error === "urn:ietf:params:acme:error:unauthorized" && (detail.startsWith("No TXT record found at") || detail.startsWith("Invalid TXT record [...]"))
+        // .. because acme's dns just might need to catch up first
 
         // if (!authStatus.ok)
         // {
         //   throw new Error("Order status check failed: " + JSON.stringify(await authStatus.json()));
         // }
 
-        const authJson = await authStatus.json();
-        //console.log("authJson", authJson);
+        // const authJson = await authStatus.json();
+        // console.debug("authJson", authJson);
 
-        const status = getStringFromJson("status", authJson);
+        // const status = getStringFromJson("status", authJson);
+        // console.debug("status", status);
 
-        //console.log("status", status);
-
-        if (!["pending", "valid"].includes(status))
-        {
-          throw new Error(`response auth status not 'pending' or 'valid', but '${status}': response: ${JSON.stringify(authJson)}`); // TODO: error message instead of whole json
-        }
+        // if (!["pending", "valid"].includes(status))
+        // {
+        //   throw new Error(`response auth status not 'pending' or 'valid', but '${status}': response: ${JSON.stringify(authJson)}`); // TODO: error message instead of whole json
+        // }
       }
     }
     catch (err)
@@ -628,6 +891,14 @@ class ACMECloudflare extends ACMEBase
       {
         try
         {
+          console.debug(`cloudflare dns record '${dnsRecordId}':`, await (await fetch(`https://api.cloudflare.com/client/v4/zones/${cloudflareZoneId}/dns_records/${dnsRecordId}`,
+          {
+            headers:
+            {
+              "authorization": "Bearer " + this.bearer,
+            },
+          })).json());
+
           const rep = await fetch(`https://api.cloudflare.com/client/v4/zones/${cloudflareZoneId}/dns_records/${dnsRecordId}`,
           {
             method: "DELETE",
@@ -649,17 +920,17 @@ class ACMECloudflare extends ACMEBase
       }
     }
 
-    //console.log("all auths done");
+    console.log("all auths done");
   }
 }
 
 
 class ACMEHttp extends ACMEBase
 {
-  public constructor(accountKeys: JoseAccountKeys,
-    domains: Domain[], acmeDirectoryUrl: string, email?: string, csrInfo?: CSRInfo)
+  public constructor(session: ACMESession,
+    domains: Domain[], email?: string, csrInfo?: CSRInfo)
   {
-    super("http-01", accountKeys, domains, acmeDirectoryUrl, email, csrInfo);
+    super("http-01", session, domains, email, csrInfo);
   }
 
 
@@ -701,7 +972,7 @@ class ACMEHttp extends ACMEBase
       //console.log("webserver started, starting challenge...");
 
       //console.log(
-      await this.post(challengeUrl, {})
+      await this.session.post(challengeUrl, { payload: {} })
       //  );
       ;
 
@@ -792,6 +1063,14 @@ function getValueFromJson(key: string, json: Record<string, unknown>): unknown
 }
 
 
+function getValueFromJsonOrNull(key: string, json: Record<string, unknown>): unknown
+{
+  if (!(key in json))
+    throw new Error(`getValueFromJson: missing '${key}' in acme server response body`);
+  return json[key];
+}
+
+
 function checkUrl(url: string): string
 {
   if (!url.startsWith("https://"))
@@ -814,6 +1093,7 @@ function getNonceFromResponse(res: Response): Nonce
   try
   {
     const nonce: string = getHeaderFromResponse(res, "Replay-Nonce");
+    //console.debug("### NEW NONCE", nonce);
     return nonce as Nonce;
   }
   catch (_e)

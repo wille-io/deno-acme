@@ -24,23 +24,26 @@ async function shared1(accountDirectory: string, domainsWithSubdomains: string[]
 
   const domains: ACME.Domain[] = [];
 
-  for (const domainWithSubdomain of domainsWithSubdomains)
+  for (const _domainWithSubdomains of domainsWithSubdomains)
   {
-    const split = domainWithSubdomain.split(",");
-    const domainName = split[0];
-    const subdomains = split.slice(1);
+    const domainWithSubdomains = _domainWithSubdomains.split(",");
+    //console.debug("domainWithSubdomains", domainWithSubdomains);
 
-    for (const subdomain of subdomains)
-    {
-      if (!subdomain.endsWith(domainName))
-      {
-        command.showHelp();
-        console.error("Subdomains need to end with the main domain's name.");
-        Deno.exit(1);
-      }
-    }
+    const domainName = domainWithSubdomains[0];
+    const subdomains = domainWithSubdomains.slice(1);
+    //console.debug("domainName", domainName, "subdomains", subdomains);
 
-    //split[1];
+    // for (const subdomain of subdomains)
+    // {
+    //   console.debug("subdomain", subdomain);
+
+    //   if (!subdomain.endsWith(domainName))
+    //   {
+    //     command.showHelp();
+    //     console.error("Subdomains need to end with the main domain's name.");
+    //     Deno.exit(1);
+    //   }
+    // }
 
     const domain =
     {
@@ -63,7 +66,7 @@ async function shared1(accountDirectory: string, domainsWithSubdomains: string[]
     if (!pub || !prv)
       throw "no pub and / or prv";
 
-    accountKeys = { pemPublicKey: pub, pemPrivateKey: prv };
+    accountKeys = { privateKeyPEM: prv, publicKeyPEM: pub };
 
     console.log("using existing account keys");
   }
@@ -90,13 +93,13 @@ async function shared2(accountDirectory: string, accountKeys: ACME.AccountKeys |
 {
   if (!accountKeys)
   {
-    await Deno.writeTextFile(accountDirectory + "/accountPrivateKey.pem", pemAccountKeys.pemPrivateKey);
-    await Deno.writeTextFile(accountDirectory + "/accountPublicKey.pem", pemAccountKeys.pemPublicKey);
+    await Deno.writeTextFile(accountDirectory + "/accountPrivateKey.pem", pemAccountKeys.privateKeyPEM);
+    await Deno.writeTextFile(accountDirectory + "/accountPublicKey.pem", pemAccountKeys.publicKeyPEM);
     console.log("saved new account keys");
   }
 
-  //console.log("certs", domainCertificates);
-  //console.log("keys", pemAccountKeys);
+  // console.debug("certs", domainCertificates);
+  // console.debug("keys", pemAccountKeys);
 
   for (const domainCertificate of domainCertificates)
   {
@@ -115,7 +118,7 @@ async function shared2(accountDirectory: string, accountKeys: ACME.AccountKeys |
 
 const command = new Command()
 .name("acme-cli")
-.version("v0.3.0")
+.version("v0.3.1")
 .description("Get certificates for your domains and or your domains their subdomains with the specified challenge type from an acme server. \r\n"+
   "One certificate is created per challenge argument. \r\n"+
   "You can either get a certificate for a domain *and* its subdomains or for a domain only (without subdomains). It is not possible to get a certificate with only subdomains (without its parent domain).\r\n"+
@@ -151,7 +154,7 @@ const command = new Command()
 .env("CLOUDFLARE_BEARER=<value:string>", "Your Cloudflare API token bearer to list, create and delte temporary acme TXT records with.", { required: true })
 .meta("Cloudflare API version", "4")
 .arguments("<domains...:string>")
-.example("Get two certificates", "example.com:example.com,subdomain.example.com example2.com:subdomain.example2.com,subdomain2.example2.com")
+.example("Get two certificates", "example.com,subdomain.example.com subdomain2.example.com")
 .action(async (options, ...args) =>
 {
   const { email, directory, accountDirectory, cloudflareBearer } = options;
