@@ -16,26 +16,27 @@ Use the CLI as a standalone acme client, or use the acme.ts library to use it in
 
 ## CLI
 How to get & use the CLI:
-```
-sudo deno install -A --allow-read=. --allow-write=. --allow-net --name acme --root /usr/local/ https://deno.land/x/acme@v0.3.1/cli.ts
+```bash
+sudo deno install -A --allow-read=. --allow-write=. --allow-net --name acme --root /usr/local/ https://deno.land/x/acme@v0.4.0/cli.ts
 # http challenge:
 sudo acme http example.com,subdomain.example.com
 # cloudflare dns challenge:
-sudo acme cloudflare example.com,subdomain.example.com
+acme cloudflare example.com,subdomain.example.com
 ```
+Note: For http challenges permissions to bind to port 80 are needed. Otherwise use the root user or use `sudo` - like in the example above.
 
 ## Library
-To use acme as a library in your application, add the following:
-```
-import * as ACME from "https://deno.land/x/acme@v0.3.1/acme.ts"
+To use acme as a library in your application, add the following (minimal example with temporary & anonymous acme account creation):
+```typescript
+import * as ACME from "https://deno.land/x/acme@v0.4.0/acme.ts"
 
 // http challenge:
-const { domainCertificates } = await ACME.getCertificatesWithHttp("example.com", "https://acme-staging-v02.api.letsencrypt.org/directory");
+const { domainCertificates } = await ACME.getCertificatesWithHttp("example.com");
 console.log(domainCertificates);
 
 // cloudflare dns challenge:
 const cloudflareToken = Deno.env.get("CLOUDFLARE_TOKEN");
-const { domainCertificates } = await ACME.getCertificatesWithCloudflare(cloudflareToken, "example.com", "https://acme-staging-v02.api.letsencrypt.org/directory");
+const { domainCertificates } = await ACME.getCertificatesWithCloudflare(cloudflareToken, "example.com");
 console.log(domainCertificates);
 ```
 

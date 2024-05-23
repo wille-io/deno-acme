@@ -34,20 +34,30 @@ async function createSession(acmeDirectoryUrl: string, options?: { pemAccountKey
 }
 
 
-export async function getCertificateWithHttp(domainName: string, acmeDirectoryUrl: string, options?: { yourEmail?: string,
+function getAcmeDirectoryUrl(acmeDirectoryUrl?: string): string
+{
+  if (acmeDirectoryUrl)
+    return acmeDirectoryUrl;
+  console.warn("IMPORTANT: By not supplying a acme directory url, you are always accepting Let's Encrypt's current general Terms of Service and their Subscriber Agreement which you can find at 'https://acme-v02.api.letsencrypt.org/directory' in json key 'meta.termsOfService'");
+  return "https://acme-v02.api.letsencrypt.org/directory";
+}
+
+
+export async function getCertificateWithHttp(domainName: string, options?: { acmeDirectoryUrl: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo  })
     : Promise<{domainCertificate: DomainCertificate, pemAccountKeys: AccountKeys}>
 {
-  const ret = await getCertificatesWithHttp([{ domainName }], acmeDirectoryUrl, options);
+  const ret = await getCertificatesWithHttp([{ domainName }], options);
   return { domainCertificate: ret.domainCertificates[0], pemAccountKeys: ret.pemAccountKeys };
 }
 
 
-export async function getCertificatesWithHttp(domains: Domain[], acmeDirectoryUrl: string, options?: { yourEmail?: string,
+export async function getCertificatesWithHttp(domains: Domain[], options?: { acmeDirectoryUrl: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
   : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
 {
-  const session = await createSession(acmeDirectoryUrl, { pemAccountKeys: options?.pemAccountKeys, email: options?.yourEmail });
+  const session = await createSession(getAcmeDirectoryUrl(options?.acmeDirectoryUrl),
+    { pemAccountKeys: options?.pemAccountKeys, email: options?.yourEmail });
   return {
     domainCertificates: await new ACMEHttp(session, domains, options?.yourEmail, options?.csrInfo).getCertificates(),
     pemAccountKeys: await session.exportAccount(),
@@ -55,20 +65,21 @@ export async function getCertificatesWithHttp(domains: Domain[], acmeDirectoryUr
 }
 
 
-export async function getCertificateWithCloudflare(bearer: string, domainName: string, acmeDirectoryUrl: string, options: { yourEmail?: string,
+export async function getCertificateWithCloudflare(bearer: string, domainName: string, options?: { acmeDirectoryUrl: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
     : Promise<{domainCertificate: DomainCertificate, pemAccountKeys: AccountKeys}>
 {
-  const ret = await getCertificatesWithCloudflare(bearer, [{ domainName }], acmeDirectoryUrl, options);
+  const ret = await getCertificatesWithCloudflare(bearer, [{ domainName }], options);
   return { domainCertificate: ret.domainCertificates[0], pemAccountKeys: ret.pemAccountKeys };
 }
 
 
-export async function getCertificatesWithCloudflare(bearer: string, domains: Domain[], acmeDirectoryUrl: string, options?: { yourEmail?: string,
+export async function getCertificatesWithCloudflare(bearer: string, domains: Domain[], options?: { acmeDirectoryUrl: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
   : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
 {
-  const session = await createSession(acmeDirectoryUrl, { pemAccountKeys: options?.pemAccountKeys, email: options?.yourEmail });
+  const session = await createSession(getAcmeDirectoryUrl(options?.acmeDirectoryUrl),
+    { pemAccountKeys: options?.pemAccountKeys, email: options?.yourEmail });
   return {
     domainCertificates: await new ACMECloudflare(bearer, session, domains, options?.yourEmail, options?.csrInfo).getCertificates(),
     pemAccountKeys: await session.exportAccount(),
@@ -817,8 +828,8 @@ class ACMECloudflare extends ACMEBase
 
 
       // creating txt record(s) done - waiting for acme's dns to catch up
-      console.log("giving the acme server time (3s) to catch up...");
-      await waitSeconds(3);
+      console.log("giving the acme server time (15s) to catch up...");
+      await waitSeconds(15); // TODO: shorter wait, try again if 'invalid' for n times until not 'invalid' anymore
 
 
       // fire all challenges
@@ -951,7 +962,7 @@ class ACMEHttp extends ACMEBase
 
 
       // TODO: don't use serve
-      serve((request: Request): Response =>
+      serve((request: Request): Response => // TODO: AbortController
       {
         //console.log("!!!");
         if (!request.url.endsWith("/.well-known/acme-challenge/" + token))

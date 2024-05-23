@@ -118,11 +118,13 @@ async function shared2(accountDirectory: string, accountKeys: ACME.AccountKeys |
 
 const command = new Command()
 .name("acme-cli")
-.version("v0.3.1")
+.version("v0.4.0")
 .description("Get certificates for your domains and or your domains their subdomains with the specified challenge type from an acme server. \r\n"+
   "One certificate is created per challenge argument. \r\n"+
-  "You can either get a certificate for a domain *and* its subdomains or for a domain only (without subdomains). It is not possible to get a certificate with only subdomains (without its parent domain).\r\n"+
-  "Subdomains are added to the domain name with commas. Example: example.com,subdomain.example.com,another-subdomain.example.com")
+  "You can either get a certificate for a domain *and* its subdomains or for a domain only (without subdomains). It is not possible to get a certificate with only subdomains (without its parent domain). \r\n"+
+  "Subdomains are added to the domain name with commas. Example: example.com,subdomain.example.com,another-subdomain.example.com \r\n" +
+  "IMPORTANT: By not supplying a acme directory url, you are always accepting Let's Encrypt's current general Terms of Service and their Subscriber Agreement which you can find at 'https://acme-v02.api.letsencrypt.org/directory' in json key 'meta.termsOfService'"
+)
 .globalOption("-d, --directory <directory>", "Https url to the acme server's acme directory.", { default: "https://acme-v02.api.letsencrypt.org/directory" as const })
 .globalOption("-e, --email <email>", "Your email address for the acme server to notify you on notifications of your certificates")
 .globalOption("-a, --accountDirectory <accountDirectory>", "The directory where the account keys of your acme server will be read from / written to", { default: `${Deno.env.get("HOME") || Deno.cwd()}/.deno-acme` as const })
@@ -143,7 +145,7 @@ const command = new Command()
   const { domains, accountKeys } = await shared1(accountDirectory, domainsWithSubdomains);
 
   const { domainCertificates, pemAccountKeys } =
-    await ACME.getCertificatesWithHttp(domains, directory, { yourEmail: email, pemAccountKeys: accountKeys, /*csrInfo*/ });
+    await ACME.getCertificatesWithHttp(domains, { acmeDirectoryUrl: directory, yourEmail: email, pemAccountKeys: accountKeys, /*csrInfo*/ });
 
   await shared2(accountDirectory, accountKeys, pemAccountKeys, domainCertificates);
   Deno.exit(0);
@@ -164,7 +166,7 @@ const command = new Command()
   const { domains, accountKeys } = await shared1(accountDirectory, domainsWithSubdomains);
 
   const { domainCertificates, pemAccountKeys } =
-    await ACME.getCertificatesWithCloudflare(cloudflareBearer, domains, directory, { yourEmail: email, pemAccountKeys: accountKeys, /*csrInfo*/ });
+    await ACME.getCertificatesWithCloudflare(cloudflareBearer, domains, { acmeDirectoryUrl: directory, yourEmail: email, pemAccountKeys: accountKeys, /*csrInfo*/ });
 
   await shared2(accountDirectory, accountKeys, pemAccountKeys, domainCertificates);
   Deno.exit(0);
