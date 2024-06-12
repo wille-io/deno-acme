@@ -686,15 +686,7 @@ abstract class ACMEBase
     console.debug("> cert");
 
     const res = await this.session.post(certificateUrl);
-    const text = await res.text();
-    const certList = text.split("-----END CERTIFICATE-----").map(cert => cert + "-----END CERTIFICATE-----");
-
-    if (certList.length < 1)
-    {
-      throw new Error("getCert: no valid certificate received from acme server - response text was: " + text);
-    }
-
-    const cert = certList[0];
+    const cert = await res.text();
 
     return cert;
   }
