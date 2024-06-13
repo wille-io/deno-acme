@@ -42,7 +42,7 @@ function getAcmeDirectoryUrl(acmeDirectoryUrl?: string): string
 }
 
 
-export async function getCertificateWithHttp(domainName: string, options?: { acmeDirectoryUrl: string, yourEmail?: string,
+export async function getCertificateWithHttp(domainName: string, options?: { acmeDirectoryUrl?: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo, httpRequestQueue?: HttpRequestQueue })
     : Promise<{domainCertificate: DomainCertificate, pemAccountKeys: AccountKeys}>
 {
@@ -54,7 +54,7 @@ export async function getCertificateWithHttp(domainName: string, options?: { acm
 export interface RequestWithResolver
 {
   request: Request;
-  resolver: (response: Response) => void;
+  resolver: (response: Response | null) => void;
 }
 
 
@@ -94,6 +94,10 @@ export class AsyncQueue<T>
 
 export class HttpRequestQueue extends AsyncQueue<(RequestWithResolver | null)>
 {
+  #stopped: boolean = false;
+
+  get stopped() { return this.#stopped; }
+
   stop()
   {
     while (this.resolvers.length > 0)
@@ -111,7 +115,7 @@ export function createHttpRequestQueue()
 }
 
 
-export async function getCertificatesWithHttp(domains: Domain[], options?: { acmeDirectoryUrl: string, yourEmail?: string,
+export async function getCertificatesWithHttp(domains: Domain[], options?: { acmeDirectoryUrl?: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo, httpRequestQueue?: HttpRequestQueue })
   : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
 {
@@ -124,7 +128,7 @@ export async function getCertificatesWithHttp(domains: Domain[], options?: { acm
 }
 
 
-export async function getCertificateWithCloudflare(bearer: string, domainName: string, options?: { acmeDirectoryUrl: string, yourEmail?: string,
+export async function getCertificateWithCloudflare(bearer: string, domainName: string, options?: { acmeDirectoryUrl?: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
     : Promise<{domainCertificate: DomainCertificate, pemAccountKeys: AccountKeys}>
 {
@@ -133,7 +137,7 @@ export async function getCertificateWithCloudflare(bearer: string, domainName: s
 }
 
 
-export async function getCertificatesWithCloudflare(bearer: string, domains: Domain[], options?: { acmeDirectoryUrl: string, yourEmail?: string,
+export async function getCertificatesWithCloudflare(bearer: string, domains: Domain[], options?: { acmeDirectoryUrl?: string, yourEmail?: string,
   pemAccountKeys?: AccountKeys, csrInfo?: CSRInfo })
   : Promise<{domainCertificates: DomainCertificate[], pemAccountKeys: AccountKeys}>
 {
@@ -1015,9 +1019,9 @@ class DefaultHttpListener
           }
         }
       },
-      (request) =>
+      async (request) =>
         {
-          return new Promise((resolver) =>
+          const response = await new Promise<Response | null>((resolver) =>
           {
             if (!this.httpRequestQueue)
             {
@@ -1026,6 +1030,13 @@ class DefaultHttpListener
 
             this.httpRequestQueue.push({ request, resolver });
           });
+
+          if (!response)
+          {
+            return new Response(null, { status: 400 });
+          }
+
+          return response;
         }
      ); // NOTE: event loop now active!
 
@@ -1090,14 +1101,14 @@ class ACMEHttp extends ACMEBase
   }
 
 
-  private static checkRequest(token: string, keyAuth: string, request: Request): Response
+  private static checkRequest(token: string, keyAuth: string, request: Request): Response | null
   {
     // console.debug("http request received");
 
     if (!request.url.endsWith("/.well-known/acme-challenge/" + token))
     {
       // console.debug("checkRequest 400", token, keyAuth);
-      return new Response(null, { status: 400 });
+      return null;
     }
 
     // console.debug("valid request from acme server");

@@ -25,12 +25,17 @@ Deno.serve(
     {
       console.log("request received!");
 
-      const response = await new Promise<Response>((resolver) =>
+      const response = await new Promise<Response | null>((resolver) =>
       {
         httpRequestQueue.push({ request, resolver });
       });
 
       console.log("request response!", response);
+
+      if (!response)
+      {
+        return new Response(null, { status: 400 });
+      }
 
       return response;
     }
