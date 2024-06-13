@@ -17,7 +17,7 @@ Use the CLI as a standalone acme client, or use the acme.ts library to use it in
 ## CLI
 How to get & use the CLI:
 ```bash
-sudo deno install -A --allow-read=. --allow-write=. --allow-net --name acme --root /usr/local/ https://deno.land/x/acme@v0.4.0/cli.ts
+sudo deno install -A --allow-read=. --allow-write=. --allow-net --name acme --root /usr/local/ https://deno.land/x/acme@v0.4.1/cli.ts
 # http challenge:
 sudo acme http example.com,subdomain.example.com
 # cloudflare dns challenge:
@@ -28,7 +28,7 @@ Note: For http challenges permissions to bind to port 80 are needed. Otherwise u
 ## Library
 To use acme as a library in your application, add the following (minimal example with temporary & anonymous acme account creation):
 ```typescript
-import * as ACME from "https://deno.land/x/acme@v0.4.0/acme.ts"
+import * as ACME from "https://deno.land/x/acme@v0.4.1/acme.ts"
 
 // http challenge:
 const { domainCertificates } = await ACME.getCertificatesWithHttp("example.com");

@@ -118,7 +118,7 @@ async function shared2(accountDirectory: string, accountKeys: ACME.AccountKeys |
 
 const command = new Command()
 .name("acme-cli")
-.version("v0.4.0")
+.version("v0.4.1")
 .description("Get certificates for your domains and or your domains their subdomains with the specified challenge type from an acme server. \r\n"+
   "One certificate is created per challenge argument. \r\n"+
   "You can either get a certificate for a domain *and* its subdomains or for a domain only (without subdomains). It is not possible to get a certificate with only subdomains (without its parent domain). \r\n"+
