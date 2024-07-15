@@ -17,7 +17,7 @@ Use the CLI as a standalone acme client, or use the acme.ts library to use it in
 ## CLI
 How to get & use the CLI:
 ```bash
-sudo deno install -A --allow-read=. --allow-write=. --allow-net --name acme --root /usr/local/ https://deno.land/x/acme@v0.4.1/cli.ts
+sudo deno install -A --name acme --root /usr/local/ https://deno.land/x/acme@v0.4.1/cli.ts
 # http challenge:
 sudo acme http example.com,subdomain.example.com
 # cloudflare dns challenge:
