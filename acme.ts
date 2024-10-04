@@ -27,9 +27,19 @@ type Kid = string;
 
 async function createSession(acmeDirectoryUrl: string, options?: { pemAccountKeys?: AccountKeys, email?: string }): Promise<ACMESession>
 {
-  return (options?.pemAccountKeys)
-    ? await ACMESession.login(options.pemAccountKeys.privateKeyPEM, options.pemAccountKeys.publicKeyPEM, acmeDirectoryUrl)
-    : await ACMESession.register(acmeDirectoryUrl, options?.email);
+  if (options?.pemAccountKeys)
+  {
+    const account = await ACMESession.login(options.pemAccountKeys.privateKeyPEM, options.pemAccountKeys.publicKeyPEM, acmeDirectoryUrl);
+
+    if (options?.email)
+    {
+      await account.updateEmail(options.email);
+    }
+
+    return account;
+  }
+
+  return await ACMESession.register(acmeDirectoryUrl, options?.email);
 }
 
 
@@ -197,6 +207,16 @@ export class ACMESession
   private acmeDirectoryUrls: AcmeDirectoryUrls;
 
 
+  public async updateEmail(email: string)
+  {
+    // 7.3.2.  Account Update
+
+    console.debug("updateEmail");
+
+    await this.post(this.account.kid, { payload: { contact: [`mailto:${email}`] }, expectedAcmeStatus: [ ACMEStatus.pending, ACMEStatus.valid ] });
+  }
+
+
   public jwk(): jose.JWK
   {
     return this.account.publicKeyJWK;
@@ -280,13 +300,14 @@ export class ACMESession
       }
     );
 
-    // TODO: 7.3.3. ?
-
     const kid = getHeaderFromResponse(res, "location");
     // console.debug("kid", kid);
 
+    // TODO: 7.3.3. ?
+
     return new ACMESession(nonce, new ACMEAccount(privateKey, publicKey, jwk, kid), acmeDirectoryUrls);
   }
+
 
   public static async register(acmeDirectoryUrl: string, email?: string): Promise<ACMESession>
   {
@@ -314,7 +335,7 @@ export class ACMESession
     const kid = getHeaderFromResponse(res, "location");
     // console.debug("kid", kid);
 
-    return new ACMESession(nonce, new ACMEAccount( privateKey, publicKey, jwk, kid), acmeDirectoryUrls);
+    return new ACMESession(nonce, new ACMEAccount(privateKey, publicKey, jwk, kid), acmeDirectoryUrls);
   }
 
 
